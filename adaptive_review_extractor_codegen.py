@@ -1,4 +1,3 @@
-# adaptive_review_extractor_codegen.py
 import os
 import sys
 import json
@@ -11,362 +10,579 @@ import tempfile
 import subprocess
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Any, Tuple
-print(">>> SCRIPT STARTED <<<")
 
-# =========================
+
 # Config / Logging
-# =========================
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 MAX_CODE_GENERATION_ATTEMPTS = 5
 MAX_CONSECUTIVE_FAILURES = 3
 BATCH_SIZE = 50
-MAX_PAGES = 200  # safety cap
+MAX_PAGES = 200
+SAMPLE_HTML_MAX_CHARS = 150_000
+SAMPLE_HTML_MIN_LEN = 512
 
-# =========================
-# Bright Data config
-# =========================
+
+# Bright Data config (HTTP API for Web Unlocker)
+
 @dataclass
 class BrightDataConfig:
     api_key: str
-    zone: str = "web_unlocker1"     # your zone name
+    zone: str = "web_unlocker1"
     country: str = "US"
     endpoint: str = "https://api.brightdata.com/request"
-    render_js: bool = True
-    timeout_s: int = 60
+    render_js_hint: bool = True   # hint for server-side render param
+    timeout_s: int = 40
     retries: int = 3
 
 def initialize_brightdata_proxy(cfg: BrightDataConfig):
-    """
-    Simple session-id pool for Bright Data. Web Unlocker handles IP/CAPTCHAs;
-    session_id provides stickiness/rotation across requests.
-    """
     class _Pool:
         def __init__(self):
-            self.counter = 0
+            self.i = 0
+            self.sessions = [f"sess-{int(time.time())}-{k}-{uuid.uuid4().hex[:6]}" for k in range(10)]
         def get_next(self) -> str:
-            self.counter += 1
-            return f"sess-{int(time.time())}-{self.counter}-{uuid.uuid4().hex[:6]}"
+            self.i += 1
+            return self.sessions[self.i % len(self.sessions)]
     return _Pool()
 
-# =========================
-# LLM plumbing (stubs you replace)
-# =========================
-def load_custom_prompt(tenant_id: str, target_url: str) -> str:
-    # Customize per tenant/site as needed
-    return """You are generating Python scraper code.
-- Import `bd_fetch_html` from `bd_sdk` (we provide this module in the sandbox).
-- Implement: run(url: str, page: int, limit: int, session_id: str) -> list[dict]
-- Use bd_fetch_html(url, session_id=session_id) to fetch HTML (JS-rendered via Bright Data).
-- Parse reviews using BeautifulSoup or lxml.
-- Return list of dicts with keys: text, rating, date, author.
-- Support pagination using `page` (e.g., ?page=2) when applicable.
-- Respect `limit` to cap results in a single call.
-- On errors or when nothing found, return [] (do not raise).
-"""
 
-def call_llm(prompt: str) -> str:
-    # Demo stub returns an Amazon-style scraper.
-    # In production, replace with a real LLM call.
-    return '''\
-import urllib.parse as _up
-import re
-from bs4 import BeautifulSoup
-from bd_sdk import bd_fetch_html
+# Support module sources we drop into sandbox:
+#  - bd_sdk.py       (HTTP API fetcher)
+#  - renderers.py    (Selenium headless renderer with proxy)
+#  - shields.py      (robot/CAPTCHA detection)
+#  - runner.py       (exec harness)
 
-def _txt(el): return el.get_text(" ", strip=True) if el else None
-def _num(s):
-    if not s: return None
-    m = re.search(r"(\\d+(?:\\.\\d+)?)", s)
-    try: return float(m.group(1)) if m else None
-    except: return None
-
-def _with_page_number(url: str, page: int) -> str:
-    # Ensure we drive Amazon pagination via pageNumber=
-    parsed = _up.urlparse(url)
-    q = dict(_up.parse_qsl(parsed.query))
-    q["pageNumber"] = str(page if page else 1)
-    new_query = _up.urlencode(q)
-    return _up.urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
-
-def run(url: str, page: int, limit: int, session_id: str):
-    paged_url = _with_page_number(url, page or 1)
-    html = bd_fetch_html(paged_url, session_id=session_id)
-    soup = BeautifulSoup(html, "lxml")  # use lxml for robustness/speed
-
-    out = []
-    # Each review card:
-    for box in soup.select("div[data-hook='review']"):
-        text   = _txt(box.select_one("[data-hook='review-body']"))
-        rating = _num(_txt(box.select_one("[data-hook='review-star-rating']")))
-        date   = _txt(box.select_one("[data-hook='review-date']"))
-        author = _txt(box.select_one("[data-hook='review-author']")) or _txt(box.select_one(".a-profile-name"))
-
-        if text:
-            out.append({"text": text, "rating": rating, "date": date, "author": author})
-            if limit and len(out) >= limit:
-                break
-
-    return out
-'''
-
-def parse_code_from_response(code: str) -> str:
-    # Hook to lint/scan the code if you want.
-    return code
-
-def create_fix_prompt(original_code: str, error: str, error_history: List[str], url: str) -> str:
-    prev = ""
-    if error_history:
-        prev = "Previous errors:\\n" + "\\n".join(f"- {e}" for e in error_history[:-1])
-    return f"""The following Python scraper failed.
-
-URL: {url}
-
-Original Code:
-{original_code}
-
-Error encountered:
-{error}
-
-{prev}
-
-Please FIX the code to:
-1) Keep using `from bd_sdk import bd_fetch_html`
-2) Keep the function signature: run(url, page, limit, session_id) -> list[dict]
-3) Maintain pagination (via 'page' param or by discovering 'next')
-4) Be robust to missing DOM elements
-Return ONLY the corrected Python code.
-"""
-
-# =========================
-# Bright Data SDK injected into sandbox (requests-based; no curl)
-# =========================
 def _bd_sdk_source(cfg: BrightDataConfig) -> str:
-    """
-    Written into the sandbox so generated code can:
-        from bd_sdk import bd_fetch_html
-    This wraps Bright Data Web Unlocker with requests.post and returns HTML.
-    """
     return f'''\
-import os, json, time, random
-import requests
+import requests, time, random
 
-BRIGHTDATA_API = "{cfg.endpoint}"
-BRIGHTDATA_ZONE = "{cfg.zone}"
-BRIGHTDATA_COUNTRY = "{cfg.country}"
-BRIGHTDATA_RENDER = {str(cfg.render_js)}
-BRIGHTDATA_TIMEOUT = {cfg.timeout_s}
+API_ENDPOINT = "{cfg.endpoint}"
+API_KEY = "{cfg.api_key}"
+ZONE = "{cfg.zone}"
+COUNTRY = "{cfg.country}"
+TIMEOUT = {cfg.timeout_s}
+RENDER_HINT = {str(cfg.render_js_hint)}
 
-API_KEY = os.getenv("BRIGHTDATA_API_KEY")
-if not API_KEY:
-    raise RuntimeError("BRIGHTDATA_API_KEY not set in sandbox")
+def _ua():
+    uas = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
+    ]
+    return random.choice(uas)
 
-def bd_fetch_html(url: str, session_id: str = None, retries: int = 3) -> str:
+def bd_fetch_html(url: str, session_id: str = None, render: bool = None, retries: int = 3) -> str:
     payload = {{
-        "zone": BRIGHTDATA_ZONE,
+        "zone": ZONE,
         "url": url,
         "format": "raw",
-        "render": BRIGHTDATA_RENDER,
-        "country": BRIGHTDATA_COUNTRY
+        "render": (RENDER_HINT if render is None else render),
+        "country": COUNTRY,
+        "headers": {{
+            "User-Agent": _ua(),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive",a
+            "Upgrade-Insecure-Requests": "1"
+        }}
     }}
     if session_id:
-        # Some accounts expect "session_id" instead of "session".
-        # If your account requires "session_id", swap the key below.
         payload["session"] = session_id
+
     headers = {{
         "Content-Type": "application/json",
         "Authorization": f"Bearer {{API_KEY}}"
     }}
-    last_status = None
-    for attempt in range(1, retries+1):
-        r = requests.post(BRIGHTDATA_API, headers=headers, data=json.dumps(payload), timeout=BRIGHTDATA_TIMEOUT)
-        if r.ok and r.text:
-            return r.text
-        last_status = r.status_code
-        time.sleep(min(2 ** attempt, 8) + random.random())
-    raise RuntimeError(f"Bright Data fetch failed after {{retries}} attempts (status={{last_status}}) for {{url}}")
+
+    last = None
+    for attempt in range(1, (retries or 1) + 1):
+        try:
+            r = requests.post(API_ENDPOINT, headers=headers, json=payload, timeout=TIMEOUT)
+            last = r.text
+            if r.status_code == 200 and last and len(last) > 100:
+                low = last.lower()
+                # quick shield sniff (coarse)
+                if any(k in low for k in ["captcha", "robot check", "are you a robot", "verify you are human", "enable cookies"]):
+                    time.sleep(2 ** attempt)
+                    continue
+                return last
+            if r.status_code in (401,):
+                raise RuntimeError("Bright Data auth failed (401)")
+            if r.status_code in (429, 403, 503):
+                time.sleep(2 ** attempt + random.random())
+                continue
+            time.sleep(1)
+        except requests.exceptions.Timeout:
+            time.sleep(2 ** attempt)
+        except requests.exceptions.RequestException:
+            time.sleep(1.5)
+    raise RuntimeError(f"Web Unlocker failed for {{url}} after {{retries}} attempts; last_len={{len(last) if last else 0}}")
 '''
 
-# =========================
-# Sandbox execution utilities
-# =========================
-def create_sandbox_environment(code_src: str, bd_cfg: BrightDataConfig) -> str:
-    """
-    Creates a temp dir with:
-      - scraper.py  (LLM code)
-      - bd_sdk.py   (Bright Data wrapper)
-      - runner.py   (entry to call scraper.run(...) and print JSON)
-      - Installs deps into the temp folder so imports resolve.
-    """
-    workdir = tempfile.mkdtemp(prefix="scraper_sbx_")
-    paths = {
-        "scraper": os.path.join(workdir, "scraper.py"),
-        "bd_sdk": os.path.join(workdir, "bd_sdk.py"),
-        "runner": os.path.join(workdir, "runner.py")
-    }
-    with open(paths["scraper"], "w", encoding="utf-8") as f:
-        f.write(code_src)
-    with open(paths["bd_sdk"], "w", encoding="utf-8") as f:
-        f.write(_bd_sdk_source(bd_cfg))
+def _renderers_source() -> str:
+    return r'''\
+import os, time
 
-    runner_src = '''\
+def render_html(url: str, wait_selector: str = None, headless: bool = True, timeout_s: int = 45) -> str:
+    try:
+        import undetected_chromedriver as uc
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+    except Exception as e:
+        raise RuntimeError(f"Selenium import failed: {e}")
+
+    print(f"[DEBUG] Selenium renderer invoked for: {url}")
+    options = uc.ChromeOptions()
+    if headless:
+        options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1200,2000")
+    options.add_argument("--lang=en-US")
+    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36")
+
+    try:
+        driver = uc.Chrome(options=options)
+        driver.get(url)
+
+        if wait_selector:
+            try:
+                WebDriverWait(driver, min(timeout_s, 30)).until(EC.presence_of_element_located((By.CSS_SELECTOR, wait_selector)))
+            except Exception:
+                pass
+
+        time.sleep(2)
+        html = driver.page_source or ""
+        print(f"[DEBUG] Selenium returned HTML of length: {len(html)}")
+        return html
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+'''
+
+
+
+def _shields_source() -> str:
+    return r'''\
+def looks_blocked(html: str) -> bool:
+    if not html: return True
+    low = html.lower()
+    needles = [
+        "captcha", "robot check", "are you a robot", "verify you are human",
+        "access denied", "forbidden", "please enable cookies", "pardon the interruption",
+        "temporarily blocked", "unusual traffic", "automated queries"
+    ]
+    return any(k in low for k in needles)
+'''
+
+def _runner_source() -> str:
+    return r'''\
 import os, sys, json, importlib.util
 
 def main():
     if len(sys.argv) < 5:
-        print(json.dumps({"error":"missing args"}))
-        sys.exit(0)
+        print(json.dumps({"error":"Usage: runner.py <url> <page> <limit> <session_id>"}))
+        sys.exit(1)
     url = sys.argv[1]
-    page = int(sys.argv[2]) if sys.argv[2].isdigit() else 1
-    limit = int(sys.argv[3]) if sys.argv[3].isdigit() else 50
+    page = int(sys.argv[2])
+    limit = int(sys.argv[3])
     session_id = sys.argv[4]
     try:
         spec = importlib.util.spec_from_file_location("scraper", "scraper.py")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         if not hasattr(mod, "run"):
-            print(json.dumps({"error":"no run() found"}))
-            return
-        out = mod.run(url, page, limit, session_id)
-        if isinstance(out, list):
-            print(json.dumps(out))
-        elif out is None:
-            pass
+            print(json.dumps({"error":"No run() function found in scraper"})); return
+        result = mod.run(url, page, limit, session_id)
+        if isinstance(result, list):
+            print(json.dumps(result, ensure_ascii=False))
         else:
-            print(json.dumps(out))
+            print(json.dumps({"error": f"Invalid result type: {type(result)}"}))
     except Exception as e:
-        print(json.dumps({"error": str(e)}))
+        import traceback
+        print(json.dumps({"error": str(e), "traceback": traceback.format_exc()}))
 
 if __name__ == "__main__":
     main()
 '''
-    with open(paths["runner"], "w", encoding="utf-8") as f:
-        f.write(runner_src)
 
-    # --- Install deps into the sandbox folder so imports resolve there ---
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check",
-         "--target", workdir, "requests", "beautifulsoup4", "lxml"],
-        check=True
+# Groq client with LLAMA4
+
+def _llm_client():
+    provider = os.getenv("LLM_PROVIDER", "openai").lower()
+    if provider == "groq":
+        key = os.getenv("GROQ_API_KEY")
+        if not key:
+            raise RuntimeError("GROQ_API_KEY not set — required when LLM_PROVIDER=groq.")
+        try:
+            from groq import Groq
+            return ("groq", Groq(api_key=key))
+        except Exception as e:
+            raise RuntimeError(f"Groq client import failed: {e}")
+    else:
+        key = os.getenv("OPENAI_API_KEY")
+        if not key:
+            raise RuntimeError("OPENAI_API_KEY not set — required when LLM_PROVIDER=openai.")
+        try:
+            from openai import OpenAI
+            return ("openai", OpenAI(api_key=key))
+        except Exception as e:
+            raise RuntimeError(f"OpenAI client import failed: {e}")
+
+
+# Prompt builders (Dynamic codegen + Fix) - Guidance for LLM
+
+GUIDANCE = """
+You are generating Python **scraper code** for review extraction on an arbitrary website.
+
+HARD CONSTRAINTS (must follow exactly):
+- Imports: 
+    from bd_sdk import bd_fetch_html
+    from renderers import render_html as _render_html  # optional JS fallback
+    from shields import looks_blocked
+    from bs4 import BeautifulSoup
+- Implement a SINGLE entry point:
+    def run(url: str, page: int, limit: int, session_id: str) -> list[dict]
+- Return: list of dicts with keys: text, rating, date, author (rating/date/author may be None)
+- Respect `page`: construct/follow pagination (rel="next", aria labels, ?page=, pageNumber=, data-key ajax "load more")
+- Respect `limit`: cap results per call.
+- Use **bd_fetch_html** first. If content looks blocked or suspicious (looks_blocked or too short), then try **_render_html(url)** as fallback.
+- Parse using BeautifulSoup("lxml").
+- Robust selectors: try multiple fallbacks (common review containers + inner fields).
+- Handle missing elements with try/except; NEVER raise — return [] on failure.
+- Add debug prints: page URL, which path used (bd vs selenium), counts found, pagination guess.
+
+Extraction heuristics:
+- A "review" container often repeats; look for role="article", data-*="review", class contains review/testimonial/comment, or blocks with nearby stars + text.
+- text: prefer long text blocks inside the container; strip whitespace.
+- rating: parse floats/ints from patterns like "4.5 out of 5", "8/10", "★★★★★", etc.
+- date: strings near header/footer (time, .date, [datetime], etc.)
+- author: byline, profile link/name.
+
+Pagination heuristics:
+- First try: rel="next", link/button with aria-label*='Next', text 'Next'
+- Then: query params (?page=, page=, pageNumber=, p=)
+- Then: data-key ajax "load more" endpoints if visible in HTML (include 1 hop if trivial)
+- If no obvious pagination and page>1, return [].
+
+Output must be deterministic and within function signature.
+"""
+
+def build_generation_prompt(url: str, html_sample: str) -> str:
+    return f"{GUIDANCE}\n\nTARGET URL:\n{url}\n\nSAMPLED HTML (truncated):\n<<<HTML_START>>>\n{html_sample}\n<<<HTML_END>>>"
+
+def _extract_python_code(s: str) -> str:
+    """
+    Pull Python code out of a Markdown model response.
+    - Prefers ```python ...``` blocks (and strips the 'python' header line).
+    - Falls back to the first fenced block, else the raw string.
+    """
+    if not s:
+        return ""
+    if "```" not in s:
+        t = s.lstrip()
+        if t.lower().startswith("python\n"):
+            return t.split("\n", 1)[1] if "\n" in t else ""
+        if t.strip().lower() == "python":
+            return ""
+        return t
+
+    parts = s.split("```")  # fenced blocks are at indices 1,3,5,...
+    first_fenced = None
+    for block in parts[1::2]:
+        b = block.strip()
+        if b.lower().startswith("python"):
+            return b.split("\n", 1)[1] if "\n" in b else ""
+        if first_fenced is None:
+            first_fenced = b
+    return (first_fenced or "").strip()
+
+
+def call_llm_generate(url: str, html_sample: str) -> str:
+    provider, client = _llm_client()
+    prompt = build_generation_prompt(url, html_sample)
+
+    model = None
+    if provider == "groq":
+        # Pick any Groq model you’ve enabled. Examples:
+        #   - "llama-3.1-70b-versatile"
+        #   - "llama-3.1-8b-instant"
+        # If your internal name is "llama4", map that env var to an actual Groq model string here.
+        model = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+    else:
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "You write robust, production-grade Python scrapers that obey constraints exactly."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.2
     )
+    raw = resp.choices[0].message.content or ""
+    return _extract_python_code(raw)
+
+
+def call_llm_fix(original_code: str, error: str, url: str, html_sample: str, error_history: List[str]) -> str:
+    provider, client = _llm_client()
+
+    model = None
+    if provider == "groq":
+        model = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+    else:
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    prev = "\n".join(f"- {e}" for e in error_history[-6:])
+    fix_instructions = f"""
+The scraper failed. FIX it and return ONLY corrected Python code for the same constraints.
+
+URL: {url}
+
+Last Error:
+{error}
+
+Recent Errors:
+{prev}
+
+SAMPLED HTML (truncated):
+<<<HTML_START>>>
+{html_sample}
+<<<HTML_END>>>
+
+Keep EXACT imports and signature, add more fallbacks for selectors, pagination, shield handling, and better debug prints.
+Return [] on failure. Use _render_html fallback if bd_fetch_html looks blocked or too small.
+"""
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "You fix Python scrapers precisely and obey constraints."},
+            {"role": "user", "content": fix_instructions},
+            {"role": "user", "content": original_code}
+        ],
+        temperature=0.1
+    )
+    raw = resp.choices[0].message.content or ""
+    return _extract_python_code(raw)
+
+
+
+# Sandbox builder + executor
+
+def create_sandbox_environment(code_src: str, bd_cfg: BrightDataConfig) -> str:
+    import pkgutil
+    if not hasattr(pkgutil, "ImpImporter"):
+        pkgutil.ImpImporter = pkgutil.zipimporter
+
+    workdir = tempfile.mkdtemp(prefix="scraper_sbx_")
+    paths = {
+        "scraper":   os.path.join(workdir, "scraper.py"),
+        "bd_sdk":    os.path.join(workdir, "bd_sdk.py"),
+        "renderers": os.path.join(workdir, "renderers.py"),
+        "shields":   os.path.join(workdir, "shields.py"),
+        "runner":    os.path.join(workdir, "runner.py")
+    }
+
+    # Write sandbox modules
+    with open(paths["scraper"], "w", encoding="utf-8") as f:
+        f.write(code_src)
+    with open(paths["bd_sdk"], "w", encoding="utf-8") as f:
+        f.write(_bd_sdk_source(bd_cfg))
+    with open(paths["renderers"], "w", encoding="utf-8") as f:
+        f.write(_renderers_source())
+    with open(paths["shields"], "w", encoding="utf-8") as f:
+        f.write(_shields_source())
+    with open(paths["runner"], "w", encoding="utf-8") as f:
+        f.write(_runner_source())
+
+   # pip install dependencies into the sandbox
+    try:
+        print(f"[DEBUG] Installing deps to workdir: {workdir}")
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check",
+            "--target", workdir,
+            "setuptools<65",
+            "pip",  
+            "requests",
+            "beautifulsoup4",
+            "lxml",
+            "selenium==4.*",
+            "undetected-chromedriver",
+            "packaging",
+            "certifi",
+            "urllib3<2"
+            ],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        print(f"[DEBUG] pip install stdout:\n{proc.stdout}")
+        print(f"[DEBUG] pip install stderr:\n{proc.stderr}")
+    except subprocess.CalledProcessError as e:
+        print(f"[WARNING] pip failed: {e}")
+        print(f"[STDOUT]\n{e.stdout}")
+        print(f"[STDERR]\n{e.stderr}")
+
+
+
+    #Sanity check: pkg_resources actually present?
+    try:
+        sys.path.insert(0, workdir)
+        import pkg_resources
+        print("[DEBUG] pkg_resources is available in sandbox ✅")
+    except ImportError as e:
+        print(f"[ERROR] pkg_resources is STILL missing: {e}")
+    finally:
+        try:
+            sys.path.remove(workdir)
+        except Exception:
+            pass
 
     return workdir
 
+
 def _read_json_from_stdout(stdout: str) -> Any:
+    if not stdout:
+        return {"error": "No output"}
     try:
         return json.loads(stdout)
     except json.JSONDecodeError:
-        for line in reversed(stdout.splitlines()):
-            try:
-                return json.loads(line)
-            except Exception:
-                continue
-    return {"error": f"Invalid JSON output: {stdout[:500]}"}
+        lines = stdout.strip().splitlines()
+        for line in reversed(lines):
+            t = line.strip()
+            if t.startswith("{") or t.startswith("["):
+                try:
+                    return json.loads(t)
+                except:
+                    continue
+        return {"error": stdout[:500]}
 
 def execute_code_sandbox(code_src: str, url: str, session_id: str, bd_cfg: BrightDataConfig,
-                         limit: int = 5, timeout_s: int = 30) -> Dict[str, Any]:
-    """
-    Compile a sandbox, run generated code once (page=1, small limit), validate shape.
-    """
+                         page: int = 1, limit: int = 5, timeout_s: int = 120) -> Dict[str, Any]:
     workdir = create_sandbox_environment(code_src, bd_cfg)
     try:
-        env = {
-            "PYTHONPATH": workdir,
-            "BRIGHTDATA_API_KEY": bd_cfg.api_key,  # only secret exposed to sandbox
-        }
-        cmd = ["python", os.path.join(workdir, "runner.py"), url, "1", str(limit), session_id]
-        proc = subprocess.run(cmd, cwd=workdir, env={**os.environ, **env},
-                              capture_output=True, text=True, timeout=timeout_s)
-        stdout = proc.stdout.strip() or ""
+        env = {**os.environ, "PYTHONPATH": workdir}
+        cmd = [sys.executable, os.path.join(workdir, "runner.py"), url, str(page), str(limit), session_id]
+        proc = subprocess.run(cmd, cwd=workdir, env=env, capture_output=True, text=True, timeout=timeout_s)
+        stdout = proc.stdout.strip()
+        stderr = proc.stderr.strip()
+        if proc.returncode != 0:
+            return {"success": False, "error": f"Process failed {proc.returncode}: {stderr or stdout}"}
         data = _read_json_from_stdout(stdout)
-
         if isinstance(data, dict) and "error" in data:
             return {"success": False, "error": data["error"]}
-
-        if validate_review_structure(data):
-            return {"success": True, "data": data}
-        else:
-            return {"success": False, "error": "Invalid output structure"}
-    except subprocess.TimeoutExpired:
-        return {"success": False, "error": f"Sandbox timeout after {timeout_s}s"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
-
-def execute_code_page(code_src: str, url: str, page: int, session_id: str, bd_cfg: BrightDataConfig) -> Dict[str, Any]:
-    """
-    Execute generated code for a specific page, return {success, data?, error?}
-    """
-    workdir = create_sandbox_environment(code_src, bd_cfg)
-    try:
-        env = {"PYTHONPATH": workdir, "BRIGHTDATA_API_KEY": bd_cfg.api_key}
-        cmd = ["python", os.path.join(workdir, "runner.py"), url, str(page), "50", session_id]
-        proc = subprocess.run(cmd, cwd=workdir, env={**os.environ, **env},
-                              capture_output=True, text=True, timeout=bd_cfg.timeout_s)
-        stdout = proc.stdout.strip() or ""
-        data = _read_json_from_stdout(stdout)
-
-        if isinstance(data, dict) and "error" in data:
-            return {"success": False, "error": data["error"]}
-
         ok = validate_review_structure(data)
         return {"success": ok, "data": data if ok else None, "error": None if ok else "Invalid output structure"}
     except subprocess.TimeoutExpired:
-        return {"success": False, "error": "Timeout"}
+        return {"success": False, "error": f"Timeout after {timeout_s}s"}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": f"Sandbox failed: {e}"}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 def validate_review_structure(data: Any) -> bool:
-    if not isinstance(data, list):
-        return False
-    # minimally require non-empty "text"; other fields may be None on some sites
+    if not isinstance(data, list): return False
+    # Empty list allowed (signals end/blocked)
     for r in data:
         if not isinstance(r, dict): return False
-        if not r.get("text"): return False
+        t = r.get("text")
+        if not t or not isinstance(t, str) or len(t.strip()) < 3: return False
+        # rating/date/author optional
     return True
 
-# =========================
+
+# HTML sampler (HTTP first, then Selenium fallback)
+
+def sample_html_for_prompt(url: str, session_id: str, bd_cfg: BrightDataConfig) -> str:
+    workdir = tempfile.mkdtemp(prefix="bd_sample_")
+    try:
+        print(f"[DEBUG] Initializing temp sandbox for URL: {url}")
+
+        # Write temporary support modules
+        with open(os.path.join(workdir, "bd_sdk.py"), "w", encoding="utf-8") as f:
+            f.write(_bd_sdk_source(bd_cfg))
+        with open(os.path.join(workdir, "renderers.py"), "w", encoding="utf-8") as f:
+            f.write(_renderers_source())
+        with open(os.path.join(workdir, "shields.py"), "w", encoding="utf-8") as f:
+            f.write(_shields_source())
+
+        sys.path.insert(0, workdir)
+        from bd_sdk import bd_fetch_html 
+        from renderers import render_html  
+        from shields import looks_blocked  
+
+        print("[DEBUG] Attempting bd_fetch_html()...")
+        try:
+            html = bd_fetch_html(url, session_id=session_id, render=True, retries=bd_cfg.retries)
+            print(f"[DEBUG] Bright Data HTML length: {len(html)}")
+        except Exception as e:
+            print(f"[ERROR] bd_fetch_html() failed: {e}")
+            html = f"<!-- HTTP fetch error: {e} -->"
+
+        # Check if HTML is too short or blocked
+        if not html or len(html) < SAMPLE_HTML_MIN_LEN or looks_blocked(html):
+            print("[WARNING] HTML too short or looks blocked — triggering Selenium fallback")
+            try:
+                html2 = render_html(url, wait_selector=None, headless=True, timeout_s=45)
+                print(f"[DEBUG] Selenium render_html() length: {len(html2) if html2 else 0}")
+                if html2 and len(html2) > len(html):
+                    print("[DEBUG] Replacing HTML with Selenium version")
+                    html = html2
+            except Exception as e:
+                print(f"[ERROR] Selenium fallback failed: {e}")
+                html += f"\n<!-- Selenium fallback error: {e} -->"
+
+        # Trim sample to MAX, but take from the bottom where reviews often live
+        if html:
+            print(f"[DEBUG] Final HTML length before sample: {len(html)}")
+            return html[-SAMPLE_HTML_MAX_CHARS:]
+        else:
+            print("[ERROR] HTML completely missing after all attempts")
+            return "<!-- No HTML returned -->"
+
+    except Exception as e:
+        print(f"[ERROR] Total failure in sample_html_for_prompt: {e}")
+        return f"<!-- FAILED TO SAMPLE HTML: {e} -->"
+
+    finally:
+        try:
+            sys.path.remove(workdir)
+        except Exception:
+            pass
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+
 # Retry helper
-# =========================
+
 def execute_with_retry(code_src: str, url: str, page: int, session_id: str,
                        bd_cfg: BrightDataConfig, max_retries: int = 3) -> List[Dict]:
-    delay = 1.0
     for attempt in range(1, max_retries + 1):
-        res = execute_code_page(code_src, url, page, session_id, bd_cfg)
-        if res["success"]:
+        res = execute_code_sandbox(code_src, url, session_id, bd_cfg, page=page, limit=50)
+        if res["success"] and res["data"] is not None:
             return res["data"]
-        time.sleep(delay)
-        delay = min(delay * 2, 8)
-    raise RuntimeError(f"execute_with_retry failed after {max_retries} attempts")
+        err = res.get("error") or "Unknown"
+        print(f"[RETRY] page={page} attempt={attempt} error={err}")
+        time.sleep(min(2 ** attempt + random.random(), 12))
+    raise RuntimeError(f"execute_with_retry exhausted for page {page}")
 
-# =========================
-# Core algorithm (your pseudocode)
-# =========================
-def generate_scraper_code(prompt_template: str, url: str) -> str:
-    prompt = f"""{prompt_template}
+#pseudcode
 
-Target URL: {url}
-
-Requirements:
-- Handle pagination automatically where applicable
-- Extract fields: text, rating, date, author
-- Use CSS selectors or XPath
-- Include error handling
-- Support 'page' param if present
-- Detect end (empty result when done)
-"""
-    code = call_llm(prompt)
-    return parse_code_from_response(code)
+def generate_scraper_code(url: str, html_sample: str) -> str:
+    return call_llm_generate(url, html_sample)
 
 def attempt_recovery(current_code: str, url: str, page_number: int, error: str,
-                     error_history: List[str], bd_cfg: BrightDataConfig) -> Dict[str, Any]:
-    fix_prompt = create_fix_prompt(current_code, error, error_history, url)
-    new_code = call_llm(fix_prompt)
-    test_result = execute_code_sandbox(new_code, url, session_id=f"sess-recover-{uuid.uuid4().hex[:6]}",
-                                       bd_cfg=bd_cfg, limit=5)
-    return {"success": test_result["success"], "new_code": new_code if test_result["success"] else None}
+                     error_history: List[str], bd_cfg: BrightDataConfig, session_id: str) -> Dict[str, Any]:
+    print(f"[RECOVERY] Fixing due to: {error}")
+    html_sample = sample_html_for_prompt(url, session_id, bd_cfg)
+    new_code = call_llm_fix(current_code, error, url, html_sample, error_history)
+    smoke = execute_code_sandbox(new_code, url, session_id, bd_cfg, page=1, limit=5, timeout_s=120)
+    return {"success": smoke["success"], "new_code": new_code if smoke["success"] else None, "error": smoke.get("error")}
 
 def extract_all_reviews(working_code: str, url: str, proxy_pool, bd_cfg: BrightDataConfig,
                         error_history: List[str]) -> Tuple[List[Dict], str]:
@@ -376,123 +592,137 @@ def extract_all_reviews(working_code: str, url: str, proxy_pool, bd_cfg: BrightD
     consecutive_empty_pages = 0
     has_more_pages = True
 
-    while has_more_pages:
-        if page_number > MAX_PAGES:
-            logging.info(f"Reached MAX_PAGES={MAX_PAGES}. Stopping.")
-            break
-        try:
-            current_proxy_session = proxy_pool.get_next()
-            page_reviews = execute_with_retry(working_code, url, page_number, current_proxy_session, bd_cfg, max_retries=3)
+    print(f"[EXTRACT] start {url}")
 
+    while has_more_pages and page_number <= MAX_PAGES:
+        sess = proxy_pool.get_next()
+        try:
+            page_reviews = execute_with_retry(working_code, url, page_number, sess, bd_cfg, max_retries=3)
             if not page_reviews:
+                consecutive_empty_pages += 1
+                print(f"[EXTRACT] empty page {page_number} (streak {consecutive_empty_pages})")
                 if consecutive_empty_pages > 2:
                     has_more_pages = False
                     break
-                consecutive_empty_pages += 1
             else:
                 consecutive_empty_pages = 0
                 all_reviews.extend(page_reviews)
-                logging.info(f"Extracted {len(page_reviews)} reviews from page {page_number} (total={len(all_reviews)})")
+                print(f"[EXTRACT] page {page_number}: +{len(page_reviews)} (total {len(all_reviews)})")
 
             page_number += 1
             consecutive_failures = 0
-            time.sleep(random.uniform(1.0, 3.0))  # polite pacing
+            time.sleep(random.uniform(2.0, 5.0))  # rate limit
 
         except Exception as e:
             consecutive_failures += 1
-            logging.error(f"Failed on page {page_number}: {e}")
-            error_history.append(str(e))
+            msg = str(e)
+            print(f"[ERROR] page {page_number} failed: {msg}")
+            error_history.append(msg)
 
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                logging.error("Max consecutive failures reached. Attempting recovery...")
-                rec = attempt_recovery(working_code, url, page_number, str(e), error_history, bd_cfg)
-                if rec["success"] and rec["new_code"]:
-                    working_code = rec["new_code"]
+                print("[RECOVERY] invoking LLM fix…")
+                fix = attempt_recovery(working_code, url, page_number, msg, error_history, bd_cfg, sess)
+                if fix["success"] and fix["new_code"]:
+                    working_code = fix["new_code"]
                     consecutive_failures = 0
-                    logging.info("Recovery succeeded. Retrying page with repaired code.")
-                    continue  # retry same page with fixed code
+                    print("[RECOVERY] new code installed; retrying same page")
+                    continue
                 else:
-                    logging.error("Recovery failed. Stopping extraction.")
+                    print("[RECOVERY] fix failed; stopping")
                     break
+            else:
+                time.sleep(8)
 
+    print(f"[EXTRACT] done total={len(all_reviews)}")
     return all_reviews, working_code
 
-# =========================
-# Persistence & Logging
-# =========================
+
 def save_reviews(reviews: List[Dict], tenant_id: str):
-    os.makedirs("out", exist_ok=True)
-    path = os.path.join("out", f"{tenant_id}_{int(time.time())}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(reviews, f, ensure_ascii=False, indent=2)
-    logging.info(f"Saved {len(reviews)} reviews -> {path}")
+    os.makedirs("output", exist_ok=True)
+    ts = int(time.time())
+    fp = os.path.join("output", f"{tenant_id}_reviews_{ts}.json")
+    with open(fp, "w", encoding="utf-8") as f:
+        json.dump({"timestamp": ts, "tenant_id": tenant_id, "review_count": len(reviews), "reviews": reviews},
+                  f, ensure_ascii=False, indent=2)
+    print(f"[SAVE] {len(reviews)} reviews -> {fp}")
 
-def log(message: str): logging.info(message)
-def log_error(message: str): logging.error(message)
-
-# =========================
-# Orchestration (main)
-# =========================
+# main code where Ai generation occurs 
 def main(tenant_id: str, target_url: str, bd_cfg: BrightDataConfig) -> List[Dict]:
+    print("=== Adaptive Review Extraction System (Dynamic LLM + Selenium) ===")
+    print(f"[MAIN] tenant={tenant_id}")
+    print(f"[MAIN] url={target_url}")
+
     # Initialize
-    prompt_template = load_custom_prompt(tenant_id, target_url)
     proxy_pool = initialize_brightdata_proxy(bd_cfg)
     error_history: List[str] = []
 
-    # Generate initial code
-    scraper_code = generate_scraper_code(prompt_template, target_url)
+    # Step 1: Ask AI to Write the Code (with LIVE HTML sample)
+    print("[CODEGEN] sampling HTML for prompt…")
+    sample = sample_html_for_prompt(target_url, proxy_pool.get_next(), bd_cfg)
+    print(f"[CODEGEN] sample_len={len(sample)}")
+    scraper_code = generate_scraper_code(target_url, sample)
 
-    # Self-healing loop (test → regenerate up to N times)
+    # Step 2/3: Self-healing loop (test → if fail, fix with error + HTML)
     working_code: Optional[str] = None
-    attempts = 0
-    while working_code is None and attempts < MAX_CODE_GENERATION_ATTEMPTS:
-        attempts += 1
-        log(f"[codegen] test attempt {attempts}")
-        test_result = execute_code_sandbox(scraper_code, target_url, session_id=proxy_pool.get_next(),
-                                           bd_cfg=bd_cfg, limit=5)
-
-        if test_result["success"]:
+    for attempt in range(1, MAX_CODE_GENERATION_ATTEMPTS + 1):
+        print(f"[CODEGEN] test attempt {attempt}/{MAX_CODE_GENERATION_ATTEMPTS}")
+        test_sess = proxy_pool.get_next()
+        test = execute_code_sandbox(scraper_code, target_url, test_sess, bd_cfg, page=1, limit=5, timeout_s=120)
+        if test["success"]:
             working_code = scraper_code
+            print(f"[CODEGEN] ✅ success with {len(test['data'])} sample items")
             break
-        else:
-            err = test_result.get("error", "Unknown error")
-            error_history.append(err)
-            fix_prompt = create_fix_prompt(scraper_code, err, error_history, target_url)
-            scraper_code = call_llm(fix_prompt)
-            log_error(f"[codegen] attempt {attempts} failed: {err} -> regenerating")
+        err = test.get("error", "unknown")
+        error_history.append(err)
+        print(f"[CODEGEN] ❌ fail: {err}")
+        if attempt < MAX_CODE_GENERATION_ATTEMPTS:
+            fix_html = sample_html_for_prompt(target_url, proxy_pool.get_next(), bd_cfg)
+            scraper_code = call_llm_fix(scraper_code, err, target_url, fix_html, error_history)
 
     if working_code is None:
-        raise RuntimeError(f"Failed to generate working scraper after {MAX_CODE_GENERATION_ATTEMPTS} attempts")
+        raise RuntimeError("Failed to generate working scraper after max attempts")
 
-    # Extract all pages (with in-run recovery)
-    all_reviews, working_code = extract_all_reviews(working_code, target_url, proxy_pool, bd_cfg, error_history)
+    # Step 4/5: Collect all reviews (pagination + retry + LLM recovery)
+    print("[MAIN] full extraction…")
+    all_reviews, final_code = extract_all_reviews(working_code, target_url, proxy_pool, bd_cfg, error_history)
 
-    # Persist in batches
+    # Save in batches
     if all_reviews:
+        print("[MAIN] saving…")
         for i in range(0, len(all_reviews), BATCH_SIZE):
-            save_reviews(all_reviews[i:i+BATCH_SIZE], tenant_id)
+            save_reviews(all_reviews[i:i+BATCH_SIZE], f"{tenant_id}_batch_{i//BATCH_SIZE+1}")
+    else:
+        print("[MAIN] no reviews found")
 
+    print(f"[MAIN] done total={len(all_reviews)}")
     return all_reviews
 
-# =========================
-# CLI entrypoint
-# =========================
+
+# CLI
 if __name__ == "__main__":
     TENANT_ID = os.getenv("TENANT_ID", "demo-tenant")
-    TARGET_URL = os.getenv("TARGET_URL", "https://www.example.com/product/reviews")
-    BD_KEY = os.getenv("BRIGHTDATA_API_KEY")
-    if not BD_KEY:
-        raise SystemExit("Set BRIGHTDATA_API_KEY in your environment.")
+    TARGET_URL = os.getenv("TARGET_URL", "https://example.com/reviews")
+    BD_API_KEY = os.getenv("BRIGHTDATA_API_KEY")
+    if not BD_API_KEY:
+        print("ERROR: set BRIGHTDATA_API_KEY"); sys.exit(1)
 
     bd_cfg = BrightDataConfig(
-        api_key=BD_KEY,
+        api_key=BD_API_KEY,
         zone=os.getenv("BRIGHTDATA_ZONE", "web_unlocker1"),
         country=os.getenv("BRIGHTDATA_COUNTRY", "US"),
         endpoint=os.getenv("BRIGHTDATA_ENDPOINT", "https://api.brightdata.com/request"),
-        render_js=True,
-        timeout_s=60,
+        render_js_hint=os.getenv("BRIGHTDATA_RENDER_JS", "true").lower() == "true",
+        timeout_s=int(os.getenv("BRIGHTDATA_TIMEOUT", "40")),
         retries=3
     )
 
-    out = main(TENANT_ID, TARGET_URL, bd_cfg)
-    logging.info(f"[DONE] total reviews gathered: {len(out)}")
+    try:
+        reviews = main(TENANT_ID, TARGET_URL, bd_cfg)
+        print(f"\n✅ SUCCESS total={len(reviews)}")
+        if reviews:
+            s = reviews[0]
+            print(f"Sample: text={s.get('text','')[:120]}… rating={s.get('rating')} author={s.get('author')} date={s.get('date')}")
+    except Exception as e:
+        logging.exception("FAILED")
+        print(f"\n❌ FAILED: {e}")
+        sys.exit(1) 
