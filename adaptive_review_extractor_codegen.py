@@ -83,7 +83,7 @@ def bd_fetch_html(url: str, session_id: str = None, render: bool = None, retries
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate",
-            "Connection": "keep-alive",a
+            "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1"
         }}
     }}
