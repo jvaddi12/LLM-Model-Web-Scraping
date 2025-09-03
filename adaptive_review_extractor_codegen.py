@@ -124,19 +124,46 @@ def _renderers_source() -> str:
     return r'''\
 import os, time
 
+def _get_proxy_caps():
+    """
+    Build Selenium proxy from env:
+    PROXY_HOST, PROXY_PORT, PROXY_USERNAME, PROXY_PASSWORD
+    Returns (seleniumwire_options, http_proxy_url or None)
+    """
+    host = os.getenv("PROXY_HOST")
+    port = os.getenv("PROXY_PORT")
+    user = os.getenv("PROXY_USERNAME")
+    pwd  = os.getenv("PROXY_PASSWORD")
+    if not host or not port:
+        return None, None
+    auth = f"{user}:{pwd}@" if (user and pwd) else ""
+    proxy_url = f"http://{auth}{host}:{port}"
+    # seleniumwire
+    sw_opts = {"proxy": {"http": proxy_url, "https": proxy_url, "no_proxy": "localhost,127.0.0.1"}}
+    return sw_opts, proxy_url
+
 def render_html(url: str, wait_selector: str = None, headless: bool = True, timeout_s: int = 45) -> str:
+    """
+    Headless Chrome via Selenium for JS-heavy pages or when HTTP fetch looks blocked.
+    If PROXY_* env present, routes traffic through that proxy.
+    """
+    # Lazy import to avoid heavy deps at module import
     try:
-        import undetected_chromedriver as uc
+        from seleniumwire import webdriver
+        from selenium.webdriver.chrome.options import Options
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
+        from webdriver_manager.chrome import ChromeDriverManager
     except Exception as e:
-        raise RuntimeError(f"Selenium import failed: {e}")
+        raise RuntimeError(f"Selenium deps missing: {e}")
 
-    print(f"[DEBUG] Selenium renderer invoked for: {url}")
-    options = uc.ChromeOptions()
+    sw_opts, _ = _get_proxy_caps()
+
+    options = Options()
     if headless:
         options.add_argument("--headless=new")
+    options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
@@ -144,19 +171,21 @@ def render_html(url: str, wait_selector: str = None, headless: bool = True, time
     options.add_argument("--lang=en-US")
     options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36")
 
+    driver = webdriver.Chrome(
+        executable_path=ChromeDriverManager().install(),
+        options=options,
+        seleniumwire_options=sw_opts or {}
+    )
     try:
-        driver = uc.Chrome(options=options)
         driver.get(url)
-
         if wait_selector:
             try:
                 WebDriverWait(driver, min(timeout_s, 30)).until(EC.presence_of_element_located((By.CSS_SELECTOR, wait_selector)))
             except Exception:
                 pass
-
+        # small settle
         time.sleep(2)
         html = driver.page_source or ""
-        print(f"[DEBUG] Selenium returned HTML of length: {len(html)}")
         return html
     finally:
         try:
@@ -164,8 +193,6 @@ def render_html(url: str, wait_selector: str = None, headless: bool = True, time
         except Exception:
             pass
 '''
-
-
 
 def _shields_source() -> str:
     return r'''\
@@ -211,8 +238,7 @@ if __name__ == "__main__":
     main()
 '''
 
-# Groq client with LLAMA4
-
+#groq client
 def _llm_client():
     provider = os.getenv("LLM_PROVIDER", "openai").lower()
     if provider == "groq":
@@ -235,7 +261,7 @@ def _llm_client():
             raise RuntimeError(f"OpenAI client import failed: {e}")
 
 
-# Prompt builders (Dynamic codegen + Fix) - Guidance for LLM
+# Prompt builders (Dynamic codegen + Fix)
 
 GUIDANCE = """
 You are generating Python **scraper code** for review extraction on an arbitrary website.
@@ -309,10 +335,7 @@ def call_llm_generate(url: str, html_sample: str) -> str:
 
     model = None
     if provider == "groq":
-        # Pick any Groq model you’ve enabled. Examples:
-        #   - "llama-3.1-70b-versatile"
-        #   - "llama-3.1-8b-instant"
-        # If your internal name is "llama4", map that env var to an actual Groq model string here.
+        
         model = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
     else:
         model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -375,10 +398,6 @@ Return [] on failure. Use _render_html fallback if bd_fetch_html looks blocked o
 # Sandbox builder + executor
 
 def create_sandbox_environment(code_src: str, bd_cfg: BrightDataConfig) -> str:
-    import pkgutil
-    if not hasattr(pkgutil, "ImpImporter"):
-        pkgutil.ImpImporter = pkgutil.zipimporter
-
     workdir = tempfile.mkdtemp(prefix="scraper_sbx_")
     paths = {
         "scraper":   os.path.join(workdir, "scraper.py"),
@@ -387,8 +406,6 @@ def create_sandbox_environment(code_src: str, bd_cfg: BrightDataConfig) -> str:
         "shields":   os.path.join(workdir, "shields.py"),
         "runner":    os.path.join(workdir, "runner.py")
     }
-
-    # Write sandbox modules
     with open(paths["scraper"], "w", encoding="utf-8") as f:
         f.write(code_src)
     with open(paths["bd_sdk"], "w", encoding="utf-8") as f:
@@ -400,51 +417,19 @@ def create_sandbox_environment(code_src: str, bd_cfg: BrightDataConfig) -> str:
     with open(paths["runner"], "w", encoding="utf-8") as f:
         f.write(_runner_source())
 
-   # pip install dependencies into the sandbox
+    # deps: requests, bs4, lxml, selenium, selenium-wire, webdriver-manager
     try:
-        print(f"[DEBUG] Installing deps to workdir: {workdir}")
-        proc = subprocess.run(
+        subprocess.run(
             [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check",
-            "--target", workdir,
-            "setuptools<65",
-            "pip",  
-            "requests",
-            "beautifulsoup4",
-            "lxml",
-            "selenium==4.*",
-            "undetected-chromedriver",
-            "packaging",
-            "certifi",
-            "urllib3<2"
-            ],
+             "--target", workdir,
+             "requests", "beautifulsoup4", "lxml", "selenium==4.*", "selenium-wire", "webdriver-manager"],
             check=True,
-            capture_output=True,
-            text=True
+            capture_output=True
         )
-        print(f"[DEBUG] pip install stdout:\n{proc.stdout}")
-        print(f"[DEBUG] pip install stderr:\n{proc.stderr}")
     except subprocess.CalledProcessError as e:
         print(f"[WARNING] pip failed: {e}")
-        print(f"[STDOUT]\n{e.stdout}")
-        print(f"[STDERR]\n{e.stderr}")
-
-
-
-    #Sanity check: pkg_resources actually present?
-    try:
-        sys.path.insert(0, workdir)
-        import pkg_resources
-        print("[DEBUG] pkg_resources is available in sandbox ✅")
-    except ImportError as e:
-        print(f"[ERROR] pkg_resources is STILL missing: {e}")
-    finally:
-        try:
-            sys.path.remove(workdir)
-        except Exception:
-            pass
 
     return workdir
-
 
 def _read_json_from_stdout(stdout: str) -> Any:
     if not stdout:
@@ -501,9 +486,7 @@ def validate_review_structure(data: Any) -> bool:
 def sample_html_for_prompt(url: str, session_id: str, bd_cfg: BrightDataConfig) -> str:
     workdir = tempfile.mkdtemp(prefix="bd_sample_")
     try:
-        print(f"[DEBUG] Initializing temp sandbox for URL: {url}")
-
-        # Write temporary support modules
+        # write support modules so imports work
         with open(os.path.join(workdir, "bd_sdk.py"), "w", encoding="utf-8") as f:
             f.write(_bd_sdk_source(bd_cfg))
         with open(os.path.join(workdir, "renderers.py"), "w", encoding="utf-8") as f:
@@ -512,43 +495,28 @@ def sample_html_for_prompt(url: str, session_id: str, bd_cfg: BrightDataConfig) 
             f.write(_shields_source())
 
         sys.path.insert(0, workdir)
-        from bd_sdk import bd_fetch_html 
+        from bd_sdk import bd_fetch_html  
         from renderers import render_html  
         from shields import looks_blocked  
 
-        print("[DEBUG] Attempting bd_fetch_html()...")
+        # Try HTTP API first
         try:
             html = bd_fetch_html(url, session_id=session_id, render=True, retries=bd_cfg.retries)
-            print(f"[DEBUG] Bright Data HTML length: {len(html)}")
         except Exception as e:
-            print(f"[ERROR] bd_fetch_html() failed: {e}")
             html = f"<!-- HTTP fetch error: {e} -->"
 
-        # Check if HTML is too short or blocked
         if not html or len(html) < SAMPLE_HTML_MIN_LEN or looks_blocked(html):
-            print("[WARNING] HTML too short or looks blocked — triggering Selenium fallback")
+            # JS render fallback via Selenium+proxy if available
             try:
                 html2 = render_html(url, wait_selector=None, headless=True, timeout_s=45)
-                print(f"[DEBUG] Selenium render_html() length: {len(html2) if html2 else 0}")
                 if html2 and len(html2) > len(html):
-                    print("[DEBUG] Replacing HTML with Selenium version")
                     html = html2
             except Exception as e:
-                print(f"[ERROR] Selenium fallback failed: {e}")
                 html += f"\n<!-- Selenium fallback error: {e} -->"
 
-        # Trim sample to MAX, but take from the bottom where reviews often live
-        if html:
-            print(f"[DEBUG] Final HTML length before sample: {len(html)}")
-            return html[-SAMPLE_HTML_MAX_CHARS:]
-        else:
-            print("[ERROR] HTML completely missing after all attempts")
-            return "<!-- No HTML returned -->"
-
+        return (html or "")[:SAMPLE_HTML_MAX_CHARS]
     except Exception as e:
-        print(f"[ERROR] Total failure in sample_html_for_prompt: {e}")
         return f"<!-- FAILED TO SAMPLE HTML: {e} -->"
-
     finally:
         try:
             sys.path.remove(workdir)
@@ -556,9 +524,6 @@ def sample_html_for_prompt(url: str, session_id: str, bd_cfg: BrightDataConfig) 
             pass
         shutil.rmtree(workdir, ignore_errors=True)
 
-
-
-# Retry helper
 
 def execute_with_retry(code_src: str, url: str, page: int, session_id: str,
                        bd_cfg: BrightDataConfig, max_retries: int = 3) -> List[Dict]:
@@ -571,8 +536,7 @@ def execute_with_retry(code_src: str, url: str, page: int, session_id: str,
         time.sleep(min(2 ** attempt + random.random(), 12))
     raise RuntimeError(f"execute_with_retry exhausted for page {page}")
 
-#pseudcode
-
+#pseudocode flow - extraction and generation
 def generate_scraper_code(url: str, html_sample: str) -> str:
     return call_llm_generate(url, html_sample)
 
@@ -646,7 +610,7 @@ def save_reviews(reviews: List[Dict], tenant_id: str):
                   f, ensure_ascii=False, indent=2)
     print(f"[SAVE] {len(reviews)} reviews -> {fp}")
 
-# main code where Ai generation occurs 
+#main function for generation and self-healing
 def main(tenant_id: str, target_url: str, bd_cfg: BrightDataConfig) -> List[Dict]:
     print("=== Adaptive Review Extraction System (Dynamic LLM + Selenium) ===")
     print(f"[MAIN] tenant={tenant_id}")
@@ -656,13 +620,13 @@ def main(tenant_id: str, target_url: str, bd_cfg: BrightDataConfig) -> List[Dict
     proxy_pool = initialize_brightdata_proxy(bd_cfg)
     error_history: List[str] = []
 
-    # Step 1: Ask AI to Write the Code (with LIVE HTML sample)
+    # Ask AI to Write the Code (with LIVE HTML sample)
     print("[CODEGEN] sampling HTML for prompt…")
     sample = sample_html_for_prompt(target_url, proxy_pool.get_next(), bd_cfg)
     print(f"[CODEGEN] sample_len={len(sample)}")
     scraper_code = generate_scraper_code(target_url, sample)
 
-    # Step 2/3: Self-healing loop (test → if fail, fix with error + HTML)
+    # Self-healing loop 
     working_code: Optional[str] = None
     for attempt in range(1, MAX_CODE_GENERATION_ATTEMPTS + 1):
         print(f"[CODEGEN] test attempt {attempt}/{MAX_CODE_GENERATION_ATTEMPTS}")
@@ -682,7 +646,7 @@ def main(tenant_id: str, target_url: str, bd_cfg: BrightDataConfig) -> List[Dict
     if working_code is None:
         raise RuntimeError("Failed to generate working scraper after max attempts")
 
-    # Step 4/5: Collect all reviews (pagination + retry + LLM recovery)
+    # Collect all reviews (pagination + retry + LLM recovery)
     print("[MAIN] full extraction…")
     all_reviews, final_code = extract_all_reviews(working_code, target_url, proxy_pool, bd_cfg, error_history)
 
@@ -698,7 +662,6 @@ def main(tenant_id: str, target_url: str, bd_cfg: BrightDataConfig) -> List[Dict
     return all_reviews
 
 
-# CLI
 if __name__ == "__main__":
     TENANT_ID = os.getenv("TENANT_ID", "demo-tenant")
     TARGET_URL = os.getenv("TARGET_URL", "https://example.com/reviews")
